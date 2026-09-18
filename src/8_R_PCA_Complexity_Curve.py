@@ -8,7 +8,14 @@ Overview:
     number of Principal Components (mathematical features) extracted from the 
     Riemannian Tangent Space needed to reach peak performance.
     
-python 8_R_PCA_Complexity_Curve.py
+    METHODOLOGICAL UPDATE: Aligned with the Master Cohort preprocessing.
+    Utilizes 5-fold Stratified Group CV (to compute confidence intervals) 
+    combined with Subject-Level Majority Voting for unbiased metrics.
+    
+    *Not currently in use for the main thesis analysis.*
+    
+Execution:
+    python 8_R_PCA_Complexity_Curve.py
 =============================================================================
 """
 
@@ -20,13 +27,15 @@ import sys
 import joblib
 import warnings
 import mne
+from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sklearn.decomposition import PCA
-from sklearn.model_selection import StratifiedGroupKFold, cross_validate
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import balanced_accuracy_score
 
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir.parent))
@@ -46,7 +55,7 @@ class ROIExtractor(BaseEstimator, TransformerMixin):
 def plot_complexity_curve():
     print("🚀 STARTING SCRIPT 8: RIEMANNIAN PCA COMPLEXITY CURVE")
 
-    # 1. LAAD HET WINNENDE MODEL & DATA
+    # 1. LAAD HET WINNENDE MODEL & MASTER DATA
     model_name = "model_riemann_Theta_roi_TSSVM_Xdawn.pkl"
     model_path = RIEMANN_DATA_DIR / model_name
     if not model_path.exists():
@@ -56,38 +65,57 @@ def plot_complexity_curve():
     full_pipeline = artifact['model']
     band = artifact['band']
     
-    y = np.load(RIEMANN_DATA_DIR / "y_train_riemann.npy")
-    groups = np.load(RIEMANN_DATA_DIR / "groups_train_riemann.npy")
-    X_raw = np.load(RIEMANN_DATA_DIR / "X_train_raw.npy")
+    y_master = np.load(RIEMANN_DATA_DIR / "y_master_riemann.npy")
+    groups_master = np.load(RIEMANN_DATA_DIR / "groups_master_riemann.npy")
+    X_master = np.load(RIEMANN_DATA_DIR / "X_master_raw.npy")
 
     # 2. ISOLEER DE TANGENT SPACE PROJECTIE
     fe_pipeline = Pipeline(full_pipeline.steps[:-1])
     frozen_svm = full_pipeline.named_steps['svm'] 
     
-    print("-> Projecting raw training data to Tangent Space...")
-    X_ts = fe_pipeline.transform(X_raw)
+    print("-> Projecting raw master data to Tangent Space...")
+    X_ts = fe_pipeline.transform(X_master)
     max_features = min(20, X_ts.shape[1]) # We plotten max 20 features, net als Li et al.
 
     # 3. BEREKEN ACCURAATHEID PER AANTAL COMPONENTEN
-    print(f"-> Calculating validation scores for 1 to {max_features} components...")
+    print(f"-> Calculating Subject-Level validation scores for 1 to {max_features} components...")
     
     cv_means, cv_stds, train_means = [], [], []
     feature_range = range(1, max_features + 1)
     
-    for n_comp in feature_range:
-        # We voegen PCA toe net voor de SVM
+    # 5-fold CV to allow standard deviation calculation for the grey confidence intervals
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    
+    for n_comp in tqdm(feature_range, desc="PCA Components", colour='cyan'):
         pca_svm = Pipeline([
             ('pca', PCA(n_components=n_comp, random_state=RANDOM_STATE)),
             ('svm', SVC(C=frozen_svm.C, kernel=frozen_svm.kernel, class_weight='balanced', random_state=RANDOM_STATE))
         ])
         
-        cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-        scores = cross_validate(pca_svm, X_ts, y, groups=groups, cv=cv, scoring='balanced_accuracy', return_train_score=True)
+        fold_val_scores = []
+        fold_train_scores = []
         
-        cv_means.append(np.mean(scores['test_score']))
-        cv_stds.append(np.std(scores['test_score']))
-        train_means.append(np.mean(scores['train_score']))
-        print(f"   Features: {n_comp:<2} | CV Acc: {cv_means[-1]:.4f} | Train Acc: {train_means[-1]:.4f}")
+        for train_idx, val_idx in cv.split(X_ts, y_master, groups=groups_master):
+            X_tr, y_tr, g_tr = X_ts[train_idx], y_master[train_idx], groups_master[train_idx]
+            X_val, y_val, g_val = X_ts[val_idx], y_master[val_idx], groups_master[val_idx]
+            
+            pca_svm.fit(X_tr, y_tr)
+            
+            # Subject-Level Validation Score
+            preds_val = pca_svm.predict(X_val)
+            df_val = pd.DataFrame({'Subj': g_val, 'True': y_val, 'Pred': preds_val})
+            df_val_sub = df_val.groupby('Subj').agg(T=('True', 'first'), P=('Pred', lambda x: x.mode()[0]))
+            fold_val_scores.append(balanced_accuracy_score(df_val_sub['T'], df_val_sub['P']))
+            
+            # Subject-Level Train Score
+            preds_tr = pca_svm.predict(X_tr)
+            df_tr = pd.DataFrame({'Subj': g_tr, 'True': y_tr, 'Pred': preds_tr})
+            df_tr_sub = df_tr.groupby('Subj').agg(T=('True', 'first'), P=('Pred', lambda x: x.mode()[0]))
+            fold_train_scores.append(balanced_accuracy_score(df_tr_sub['T'], df_tr_sub['P']))
+            
+        cv_means.append(np.mean(fold_val_scores))
+        cv_stds.append(np.std(fold_val_scores))
+        train_means.append(np.mean(fold_train_scores))
 
     # 4. PLOT FIGUUR (Exact in de stijl van Li et al.)
     cv_means = np.array(cv_means)
@@ -121,6 +149,7 @@ def plot_complexity_curve():
     plt.legend(frameon=True, loc='lower right')
     plt.tight_layout()
     
+    RIEMANN_FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     plot_path = RIEMANN_FIGURES_DIR / f"Figure_3_Riemann_Complexity_Curve_{band}.png"
     plt.savefig(plot_path, dpi=300)
     plt.close()

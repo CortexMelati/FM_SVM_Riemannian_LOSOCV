@@ -1,12 +1,12 @@
 """
 =============================================================================
-1. PREPROCESS RIEMANN (SOURCE & TARGET DOMAINS, DUAL LAYOUT)
+1. PREPROCESS RIEMANN (MASTER DOMAIN & TARGET DOMAINS, DUAL LAYOUT)
 =============================================================================
 Overview:
     This unified script handles ALL covariance matrix generation.
     
-    Part A (Source Domain): Enforces the exact train/test split based on the SVM 
-    dataset to prevent data leakage.
+    Part A (Source Domain): Processes the primary dataset into a single 
+    Master Tensor for Leave-One-Subject-Out Cross-Validation (LOSOCV).
     
     Part B (Target Domain): Processes the external unseen dataset (e.g., NCCP)
     to ensure it is ready for Cross-Domain Validation (TrAdaBoost).
@@ -49,29 +49,20 @@ def apply_bandpass_filter(epochs_data, l_freq, h_freq, sfreq=500):
     ) 
 
 def process_source_domain():
-    print("🚀 STARTING PART A: SOURCE DOMAIN PREPROCESSING (TRAIN/TEST SPLIT)")
+    print("🚀 STARTING PART A: SOURCE DOMAIN PREPROCESSING (MASTER LOSOCV)")
     
-    train_csv = PROCESSED_DATA_DIR / "final_dataset_train.csv"
-    test_csv = PROCESSED_DATA_DIR / "final_dataset_test.csv"
+    master_csv = PROCESSED_DATA_DIR / "final_dataset_master.csv"
     
-    if not train_csv.exists() or not test_csv.exists():
-        raise FileNotFoundError("🚨 SVM CSV files missing. Run build_dataset.py first.")
+    if not master_csv.exists():
+        raise FileNotFoundError("🚨 Master CSV file missing. Run build_dataset.py first.")
         
-    df_train = pd.read_csv(train_csv)
-    df_test = pd.read_csv(test_csv)
+    df_master = pd.read_csv(master_csv)
+    master_subjects = df_master['Subject'].unique()
     
-    train_subjects = df_train['Subject'].unique()
-    test_subjects = df_test['Subject'].unique()
-    
-    overlap = set(train_subjects).intersection(set(test_subjects))
-    if overlap:
-        raise ValueError(f"🚨 CRITICAL ERROR: Data leakage detected. Subjects in both sets: {overlap}")
-
     file_pattern = f"*_{CONDITION}_cleaned.npy"
     subject_files = list(RESULTS_DIR.rglob(file_pattern))
     
-    X_train_list, y_train_list, group_train_list = [], [], []
-    X_test_list, y_test_list, group_test_list = [], [], []
+    X_master_list, y_master_list, group_master_list = [], [], []
 
     for file_path in subject_files:
         subject_id = file_path.name.split('_')[0]
@@ -79,49 +70,37 @@ def process_source_domain():
         
         try:
             data = np.load(file_path)
-            if subject_id in train_subjects:
-                target_macro_segments = len(df_train[df_train['Subject'] == subject_id])
+            # If the subject is in our filtered master cohort, extract the data
+            if subject_id in master_subjects:
+                target_macro_segments = len(df_master[df_master['Subject'] == subject_id])
                 data_trunc = data[:(target_macro_segments * 30)]
-                X_train_list.append(data_trunc)
-                y_train_list.extend([label] * data_trunc.shape[0])
-                group_train_list.extend([subject_id] * data_trunc.shape[0])
                 
-            elif subject_id in test_subjects:
-                data_trunc = data[:150]
-                X_test_list.append(data_trunc)
-                y_test_list.extend([label] * data_trunc.shape[0])
-                group_test_list.extend([subject_id] * data_trunc.shape[0])
+                X_master_list.append(data_trunc)
+                y_master_list.extend([label] * data_trunc.shape[0])
+                group_master_list.extend([subject_id] * data_trunc.shape[0])
+                
         except Exception as e:
             print(f"  ⚠️ Error processing {file_path.name}: {e}")
 
-    X_train = np.concatenate(X_train_list)
-    y_train = np.array(y_train_list)
-    groups_train = np.array(group_train_list)
-    X_test = np.concatenate(X_test_list)
-    y_test = np.array(y_test_list)
-    groups_test = np.array(group_test_list)
+    X_master = np.concatenate(X_master_list)
+    y_master = np.array(y_master_list)
+    groups_master = np.array(group_master_list)
 
-    print(f"  📊 Train Tensor: {X_train.shape} | Test Tensor: {X_test.shape}")
+    print(f"  📊 Master Tensor: {X_master.shape}")
 
-    # Save base labels and RAW DATA
-    np.save(RIEMANN_DATA_DIR / "X_train_raw.npy", X_train)
-    np.save(RIEMANN_DATA_DIR / "X_test_raw.npy", X_test)  
-    np.save(RIEMANN_DATA_DIR / "y_train_riemann.npy", y_train)
-    np.save(RIEMANN_DATA_DIR / "groups_train_riemann.npy", groups_train)
-    np.save(RIEMANN_DATA_DIR / "y_test_riemann.npy", y_test)
-    np.save(RIEMANN_DATA_DIR / "groups_test_riemann.npy", groups_test)
+    # Save base labels and RAW DATA for the Master cohort
+    np.save(RIEMANN_DATA_DIR / "X_master_raw.npy", X_master)
+    np.save(RIEMANN_DATA_DIR / "y_master_riemann.npy", y_master)
+    np.save(RIEMANN_DATA_DIR / "groups_master_riemann.npy", groups_master)
 
     for band_name, (l_freq, h_freq) in BANDS.items():
         print(f"  ⏳ Processing band: {band_name.upper()}...")
-        X_tr_filt = apply_bandpass_filter(X_train, l_freq, h_freq, SFREQ)
-        X_te_filt = apply_bandpass_filter(X_test, l_freq, h_freq, SFREQ)
+        X_filt = apply_bandpass_filter(X_master, l_freq, h_freq, SFREQ)
         
         # Whole Brain
-        np.save(RIEMANN_DATA_DIR / f"covs_train_{band_name}_whole.npy", Covariances(estimator='oas').transform(X_tr_filt))
-        np.save(RIEMANN_DATA_DIR / f"covs_test_{band_name}_whole.npy", Covariances(estimator='oas').transform(X_te_filt))
+        np.save(RIEMANN_DATA_DIR / f"covs_master_{band_name}_whole.npy", Covariances(estimator='oas').transform(X_filt))
         # ROI
-        np.save(RIEMANN_DATA_DIR / f"covs_train_{band_name}_roi.npy", Covariances(estimator='oas').transform(X_tr_filt[:, ROI_INDICES, :]))
-        np.save(RIEMANN_DATA_DIR / f"covs_test_{band_name}_roi.npy", Covariances(estimator='oas').transform(X_te_filt[:, ROI_INDICES, :]))
+        np.save(RIEMANN_DATA_DIR / f"covs_master_{band_name}_roi.npy", Covariances(estimator='oas').transform(X_filt[:, ROI_INDICES, :]))
 
     print("✅ Source Preprocessing Complete.\n")
 

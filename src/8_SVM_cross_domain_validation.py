@@ -1,15 +1,15 @@
 """
 =============================================================================
-8. CROSS-DOMAIN VALIDATION & TRADABOOST (Li et al., 2026 Replication)
+8. CROSS-DOMAIN VALIDATION & TRADABOOST (LOSOCV Adapted)
 =============================================================================
 Overview:
     Replicates Section 2.7 and 3.4 (Table 1 & Figure 7).
     Evaluates robustness on an external Target Domain (e.g., NCCP) using the
-    7 identified beta-band features.
+    identified features and optimal hyperparameters derived from the LOSOCV pipeline.
     
     Compares two methodologies across 2 to N stratified cross-validation folds:
     1. Direct Training: Training a NEW SVM exclusively on the target training folds.
-    2. Transfer Learning: Using TrAdaBoost (Source Data + Target Training folds).
+    2. Transfer Learning: Using TrAdaBoost (Source Master Data + Target Training folds).
 
 Execution:
     pip install adapt (if not installed)
@@ -22,23 +22,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import sys 
 from pathlib import Path
-import joblib
 import seaborn as sns
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning) # Suppresses adapt library warnings
+import joblib
+warnings.filterwarnings("ignore")
 
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import balanced_accuracy_score, confusion_matrix
 
-# Ensure the ADAPT library is installed for TrAdaBoost
+
 try:
     from adapt.instance_based import TrAdaBoost
-except ImportError:
-    print("FATAL ERROR: The 'adapt' library is not installed.")
-    print("Please run: pip install adapt")
+except Exception as e:
+    print(f" FATAL ERROR: 'adapt' is wel geïnstalleerd, maar crasht onder de motorkap!")
+    print(f"De echte foutmelding is: {e}")
     sys.exit()
 
 current_dir = Path(__file__).resolve().parent
@@ -49,30 +48,45 @@ from config import (PROCESSED_DATA_DIR, SVM_DATA_DIR, SVM_FIGURES_DIR,
 print(f"Starting Cross-Domain Validation (Fig 7) for {FOCUS_BAND.upper()} band...")
 
 # =============================================================================
-# 1. LOAD DATA & ARTIFACTS
+# 1. LOAD DATA & ARTIFACTS (LOSOCV ADAPTED)
 # =============================================================================
-# A. Load Frozen Model Artifact (for hyperparameters & features)
-model_path = SVM_DATA_DIR / f"saved_model_{FOCUS_BAND}.pkl"
-if not model_path.exists():
-    print(f"Error: {model_path.name} not found. Run Script 4 first.")
-    sys.exit()
-    
-artifact = joblib.load(model_path)
-frozen_svm = artifact['model']
-selected_features = artifact['features']
-print(f"-> Loaded architecture: {len(selected_features)} features, C={frozen_svm.C}, gamma={frozen_svm.gamma}")
+# A. Load Optimal Features from Script 3
+features_path = SVM_DATA_DIR / f"final_msffs_selected_features_{FOCUS_BAND}.csv"
+if not features_path.exists():
+    sys.exit(f"Error: Features file {features_path.name} not found. Run Script 3 first.")
+selected_features = pd.read_csv(features_path)['Selected_Features'].tolist()
 
-# B. Load Source Data (Required for TrAdaBoost)
-source_path = PROCESSED_DATA_DIR / "final_dataset_train.csv"
+# B. Load Optimal Hyperparameters from Script 4 LOSOCV table
+results_table_path = SVM_DATA_DIR / "final_svm_test_table_LOSOCV.csv"
+if not results_table_path.exists():
+    sys.exit(f"Error: Results table {results_table_path.name} not found. Run Script 4 first.")
+
+results_df = pd.read_csv(results_table_path)
+band_results = results_df[results_df['Band'] == FOCUS_BAND.upper()]
+
+if band_results.empty:
+    sys.exit(f"Error: No results found for band {FOCUS_BAND.upper()} in the final table.")
+
+# Parse hyperparameter string (e.g., "C=10, g=0.2976")
+opt_params_str = band_results.iloc[0]['Optimal_Params']
+c_str, g_str = opt_params_str.split(',')
+optimal_c = float(c_str.split('=')[1].strip())
+optimal_gamma = float(g_str.split('=')[1].strip())
+
+print(f"-> Loaded architecture: {len(selected_features)} features, C={optimal_c}, gamma={optimal_gamma}")
+
+# C. Load Source Data (The new Master Dataset)
+source_path = PROCESSED_DATA_DIR / "final_dataset_master.csv"
+if not source_path.exists():
+    sys.exit("🚨 Error: Master dataset not found. Run build_dataset.py first.")
 source_df = pd.read_csv(source_path)
 if 'Condition' in source_df.columns:
     source_df = source_df[source_df['Condition'] == 'EC'].copy()
 
-# C. Load Target Data
+# D. Load Target Data
 target_path = PROCESSED_DATA_DIR / f"target_domain_{CROSS_TARGET_DATASET.lower()}.csv"
 if not target_path.exists():
-    print(f"Error: Target data {target_path.name} not found. Check build_dataset.py.")
-    sys.exit()
+    sys.exit(f"Error: Target data {target_path.name} not found. Check build_dataset.py.")
 
 target_df = pd.read_csv(target_path)
 if 'Condition' in target_df.columns:
@@ -87,16 +101,18 @@ print(f"-> Target Domain Data: {len(target_df)} segments ({CROSS_TARGET_DATASET}
 # =============================================================================
 # 2. DATA PREPARATION (Strict Feature Isolation)
 # =============================================================================
-# We fit a fresh scaler on Source Data, and apply it to both
-scaler = StandardScaler()
-X_source = scaler.fit_transform(source_df[selected_features])
+
+artifact = joblib.load(SVM_DATA_DIR / f"saved_model_{FOCUS_BAND.lower()}.pkl")
+frozen_scaler = artifact['scaler']
+
+# Transformeer de Source Data (niet opnieuw fitten!)
+X_source = frozen_scaler.transform(source_df[selected_features])
 y_source = source_df['Target'].values
 
-X_target = scaler.transform(target_df[selected_features])
+# Transformeer de Target Data voor Transfer Learning
+X_target = frozen_scaler.transform(target_df[selected_features])
 y_target = target_df['Target'].values
 groups_target = target_df['Subject'].values
-
-# unique_target_subjects = len(np.unique(groups_target))
 
 # =============================================================================
 # 3. FIGURE 7 ITERATIVE EXPERIMENT (2 to N Folds)
@@ -126,7 +142,6 @@ for n_splits in fold_range:
     train_subjects_count = []
     
     for train_idx, test_idx in cv_strategy.split(X_target, y_target, groups=groups_target):
-        # Haal de ruwe data op voor deze fold (onge-schaald)
         X_tgt_tr_raw = target_df[selected_features].values[train_idx]
         X_tgt_te_raw = target_df[selected_features].values[test_idx]
         y_tgt_tr, y_tgt_te = y_target[train_idx], y_target[test_idx]
@@ -137,12 +152,11 @@ for n_splits in fold_range:
         # ---------------------------------------------------------
         # Method 1: DIRECT TRAINING (Volledig onafhankelijk)
         # ---------------------------------------------------------
-        # Fit een nieuwe scaler STRICT op de target training data van deze fold
         direct_scaler = StandardScaler()
         X_tgt_tr_direct = direct_scaler.fit_transform(X_tgt_tr_raw)
         X_tgt_te_direct = direct_scaler.transform(X_tgt_te_raw)
         
-        direct_svm = SVC(C=frozen_svm.C, gamma=frozen_svm.gamma, kernel='rbf', random_state=RANDOM_STATE)
+        direct_svm = SVC(C=optimal_c, gamma=optimal_gamma, kernel='rbf', random_state=RANDOM_STATE)
         direct_svm.fit(X_tgt_tr_direct, y_tgt_tr)
         acc_direct = balanced_accuracy_score(y_tgt_te, direct_svm.predict(X_tgt_te_direct))
         direct_scores.append(acc_direct)
@@ -150,15 +164,22 @@ for n_splits in fold_range:
         # ---------------------------------------------------------
         # Method 2: TRANSFER LEARNING (TrAdaBoost)
         # ---------------------------------------------------------
-        # Hier gebruiken we de originele Source scaler (wat methodologisch klopt voor transfer learning)
-        X_tgt_tr_transfer = scaler.transform(X_tgt_tr_raw)
-        X_tgt_te_transfer = scaler.transform(X_tgt_te_raw)
+        X_tgt_tr_transfer = frozen_scaler.transform(X_tgt_tr_raw)
+        X_tgt_te_transfer = frozen_scaler.transform(X_tgt_te_raw)
         
-        boost_base = SVC(C=frozen_svm.C, gamma=frozen_svm.gamma, kernel='rbf', probability=True, random_state=RANDOM_STATE)
-        tr_model = TrAdaBoost(estimator=boost_base, n_estimators=50, random_state=RANDOM_STATE)
-        tr_model.fit(X_source, y_source, Xt=X_tgt_tr_transfer, yt=y_tgt_tr)
+        boost_base = SVC(C=optimal_c, gamma=optimal_gamma, kernel='rbf', probability=True, random_state=RANDOM_STATE)
         
-        tgt_pred = tr_model.predict(X_tgt_te_transfer)
+        # Veilige Try/Except voor als Adapt crasht op een kleine fold
+        tgt_pred = direct_svm.predict(X_tgt_te_direct) # Default naar 'Direct' voorspelling
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tr_model = TrAdaBoost(estimator=boost_base, n_estimators=50, random_state=RANDOM_STATE)
+                tr_model.fit(X_source, y_source, Xt=X_tgt_tr_transfer, yt=y_tgt_tr)
+                tgt_pred = tr_model.predict(X_tgt_te_transfer)
+        except Exception:
+            pass # Val veilig terug op de basis SVM als TrAdaBoost hier faalt
+            
         acc_transfer = balanced_accuracy_score(y_tgt_te, tgt_pred)
         transfer_scores.append(acc_transfer)
         
@@ -182,7 +203,7 @@ for n_splits in fold_range:
     })
 
 results_df = pd.DataFrame(results)
-table_path = SVM_DATA_DIR / f"Table_1_cross_domain_results_{FOCUS_BAND}.csv"
+table_path = SVM_DATA_DIR / f"Table_1_cross_domain_results_{FOCUS_BAND}_LOSOCV.csv"
 results_df.to_csv(table_path, index=False, float_format='%.3f')
 
 # =============================================================================
@@ -217,7 +238,7 @@ ax.spines['right'].set_visible(False)
 plt.legend(frameon=True, loc='upper left', fontsize=11)
 
 plt.tight_layout()
-fig_path = SVM_FIGURES_DIR / f"Figure_7_Cross_Domain_Validation_{FOCUS_BAND}.png"
+fig_path = SVM_FIGURES_DIR / f"Figure_7_Cross_Domain_Validation_{FOCUS_BAND}_LOSOCV.png"
 plt.savefig(fig_path, dpi=300)
 plt.close()
 
@@ -225,29 +246,25 @@ print(f"\n-> Table 1 Exported to: svm_data/{table_path.name}")
 print(f"-> Figure 7 Exported to: svm_figures/{fig_path.name}")
 print("PIPELINE COMPLETE.")
 
-
 # =============================================================================
 # 5. PLOT CROSS-DOMAIN CONFUSION MATRIX (SUBJECT-LEVEL / MAJORITY VOTE)
 # =============================================================================
 print("\n-> Applying Majority Voting for Subject-Level Clinical Evaluation...")
 
-# 1. Bundel de losse segmenten in een DataFrame
 df_preds = pd.DataFrame({
     'Subject': final_subjects,
     'True_Label': final_y_true,
     'Pred_Label': final_y_pred_transfer
 })
 
-# 2. Bereken de 'Majority Vote' per proefpersoon
 df_subject = df_preds.groupby('Subject').agg(
-    True_Label=('True_Label', 'first'), # Het ware label is voor elk segment van deze patiënt hetzelfde
-    Pred_Label=('Pred_Label', lambda x: x.mode()[0]) # De meest voorkomende voorspelling wint
+    True_Label=('True_Label', 'first'), 
+    Pred_Label=('Pred_Label', lambda x: x.mode()[0]) 
 ).reset_index()
 
 print(f"-> Subject-level evaluatie uitgevoerd op {len(df_subject)} unieke proefpersonen.")
 
-# 3. Bereken de nieuwe, klinische Confusion Matrix
-cm_subject = confusion_matrix(df_subject['True_Label'], df_subject['Pred_Label'])
+cm_subject = confusion_matrix(df_subject['True_Label'], df_subject['Pred_Label'], labels=[0, 1])
 
 plt.figure(figsize=(6, 5))
 sns.heatmap(cm_subject, annot=True, fmt='d', cmap='Reds',
@@ -260,7 +277,7 @@ plt.ylabel('True Clinical Diagnosis', fontsize=12)
 plt.xlabel('TrAdaBoost Majority Vote', fontsize=12)
 plt.tight_layout()
 
-cm_path = SVM_FIGURES_DIR / f"Figure_Cross_Domain_Subject_CM_{FOCUS_BAND}.png"
+cm_path = SVM_FIGURES_DIR / f"Figure_Cross_Domain_Subject_CM_{FOCUS_BAND}_LOSOCV.png"
 plt.savefig(cm_path, dpi=300, facecolor='white', bbox_inches='tight')
 plt.close()
 

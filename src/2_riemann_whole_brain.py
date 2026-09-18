@@ -4,11 +4,9 @@
 =============================================================================
 Overview:
     Evaluates all 5 frequency bands using the Whole Brain layout.
+    Utilizes a strict Leave-One-Subject-Out Cross-Validation (LOSOCV) 
+    framework with nested hyperparameter tuning and subject-level majority voting.
     Saves the best model (.pkl) for each of the 5 bands.
-    Optimized via Fold-Level Pre-Transformation to prevent redundant 
-    Riemannian Mean computations during GridSearch. Includes performance timers.
-
-    for r in tqdm(range(2) <- should be 10
 
 Execution:
     python 2_riemann_whole_brain.py
@@ -24,6 +22,7 @@ import mne
 import warnings
 import time 
 from tqdm import tqdm
+from collections import Counter
 
 from pyriemann.estimation import Covariances, Coherences, XdawnCovariances
 from pyriemann.tangentspace import TangentSpace
@@ -31,7 +30,7 @@ from pyriemann.classification import MDM
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedGroupKFold, GridSearchCV
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedGroupKFold, GridSearchCV
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import balanced_accuracy_score
 
@@ -45,7 +44,7 @@ except ImportError:
         from pyriemann.utils.base import nearest_sym_pos_def
         class NearestSPD(BaseEstimator, TransformerMixin):
             def fit(self, X, y=None): return self
-            def transform(self, X): return np.array([nearest_sym_pos_def(x) for x in X])
+            def transform(self, X): return nearest_sym_pos_def(X)
 
 warnings.filterwarnings("ignore", message="DC and Nyquist bins are not defined*")
 
@@ -68,11 +67,12 @@ class AverageFrequencies(BaseEstimator, TransformerMixin):
 
 def run_whole_brain_exploration():
     total_start_time = time.time()
-    print("🚀 STARTING SCRIPT 2: FULL BRAIN EXPLORATION (19 CHANNELS)")
+    print("🚀 STARTING SCRIPT 2: FULL BRAIN EXPLORATION (19 CHANNELS - LOSOCV)")
     
-    X_raw = np.load(RIEMANN_DATA_DIR / "X_train_raw.npy")
-    y = np.load(RIEMANN_DATA_DIR / "y_train_riemann.npy")
-    groups = np.load(RIEMANN_DATA_DIR / "groups_train_riemann.npy")
+    # Laad de Master dataset in in plaats van de oude Train partition
+    X_raw = np.load(RIEMANN_DATA_DIR / "X_master_raw.npy")
+    y = np.load(RIEMANN_DATA_DIR / "y_master_riemann.npy")
+    groups = np.load(RIEMANN_DATA_DIR / "groups_master_riemann.npy")
 
     svm_param_grid = [
         {'C': [0.001, 0.01, 0.1, 1, 10], 'kernel': ['linear']},
@@ -80,73 +80,93 @@ def run_whole_brain_exploration():
     ]
 
     results = []
+    logo = LeaveOneGroupOut()
+    n_subjects = len(np.unique(groups))
 
     for band_name, (l_freq, h_freq) in BANDS.items():
         print(f"\n{'='*60}\n📡 ANALYZING: {band_name.upper()} BAND (WHOLE BRAIN)\n{'='*60}")
         band_start_time = time.time()
         
-        X_covs = np.load(RIEMANN_DATA_DIR / f"covs_train_{band_name}_whole.npy")
+        # Gebruik de Master covariance matrices
+        X_covs = np.load(RIEMANN_DATA_DIR / f"covs_master_{band_name}_whole.npy")
         architectures = ['MDM_Cov', 'TSSVM_Cov', 'TSSVM_Xdawn', 'TSSVM_Coh']
 
         for p_name in architectures:
             arch_start_time = time.time()
-            print(f" ⚙️ Evaluating Architecture: {p_name} ...")
+            print(f" ⚙️ Evaluating Architecture: {p_name} (LOSOCV over {n_subjects} subjects)...")
             
             X_input = X_covs if 'Cov' in p_name else X_raw
-            fold_scores = []
+            
+            y_true_subj = []
+            y_pred_subj = []
+            consistency_list = []
+            best_params_log = "N/A"
             
             if p_name == 'MDM_Cov':
                 pipe_mdm = MDM(metric=dict(mean='riemann', distance='riemann'))
-                # Voeg TQDM toe aan de 10 repeats
-                for r in tqdm(range(2), desc=f"   🔄 {p_name}", leave=False, colour='cyan'):
-                    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE + r)
-                    for train_idx, val_idx in cv.split(X_input, y, groups):
-                        pipe_mdm.fit(X_input[train_idx], y[train_idx])
-                        score = balanced_accuracy_score(y[val_idx], pipe_mdm.predict(X_input[val_idx]))
-                        fold_scores.append(score)
-                best_params_log = "N/A"
-            
-            else:
-                # Voeg TQDM toe aan de 10 repeats # select range(2 to 5) to find the best model, then put it on 10 rep if you want to do it on the best model
-                for r in tqdm(range(2), desc=f"   🔄 {p_name}", leave=False, colour='cyan'):
-                    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE + r)
-                    for train_idx, val_idx in cv.split(X_input, y, groups):
-                        
-                        if p_name == 'TSSVM_Cov':
-                            fe_steps = [('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
-                        elif p_name == 'TSSVM_Xdawn':
-                            fe_steps = [('filter', MNEBandPass(l_freq, h_freq, SFREQ)), ('xdawn', XdawnCovariances(nfilter=6, estimator='oas')), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
-                        elif p_name == 'TSSVM_Coh':
-                            fe_steps = [('filter', MNEBandPass(l_freq, h_freq, SFREQ)), ('coh', Coherences(coh='lagged')), ('avg_freq', AverageFrequencies()), ('spd', NearestSPD()), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
-                        
-                        fe_pipeline = Pipeline(fe_steps)
-                        
-                        X_train_trans = fe_pipeline.fit_transform(X_input[train_idx], y[train_idx])
-                        X_val_trans = fe_pipeline.transform(X_input[val_idx])
-                        
-                        cv_inner = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE + r)
-                        model_svm = SVC(class_weight='balanced', random_state=RANDOM_STATE)
-                        
-                        search = GridSearchCV(model_svm, svm_param_grid, cv=cv_inner, scoring='balanced_accuracy', n_jobs=-1, verbose=0)
-                        
-                        inner_groups = groups[train_idx]
-                        search.fit(X_train_trans, y[train_idx], groups=inner_groups)
-                        
-                        score = search.score(X_val_trans, y[val_idx])
-                        fold_scores.append(score)
                 
-                best_params_log = str(search.best_params_)
+                for train_idx, val_idx in tqdm(logo.split(X_input, y, groups), total=n_subjects, desc=f"   🔄 {p_name}", leave=False, colour='cyan'):
+                    pipe_mdm.fit(X_input[train_idx], y[train_idx])
+                    
+                    # Voorspel op alle epochs van het ongeziene subject
+                    preds_epochs = pipe_mdm.predict(X_input[val_idx])
+                    vote_counts = Counter(preds_epochs)
+                    final_vote, vote_freq = vote_counts.most_common(1)[0]
+                    
+                    # NIEUW: Bereken de consistency voor dit subject
+                    consistency = vote_freq / len(preds_epochs)
+                    
+                    y_true_subj.append(y[val_idx][0])
+                    y_pred_subj.append(final_vote)
+                    # Bewaar de consistency in een nieuwe lijst (maak bovenaan even 'consistency_list = []' aan)
+                    consistency_list.append(consistency)
+                    
+            else:
+                for train_idx, val_idx in tqdm(logo.split(X_input, y, groups), total=n_subjects, desc=f"   🔄 {p_name}", leave=False, colour='cyan'):
+                    
+                    if p_name == 'TSSVM_Cov':
+                        fe_steps = [('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
+                    elif p_name == 'TSSVM_Xdawn':
+                        fe_steps = [('filter', MNEBandPass(l_freq, h_freq, SFREQ)), ('xdawn', XdawnCovariances(nfilter=6, estimator='oas')), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
+                    # elif p_name == 'TSSVM_Coh':
+                    #     fe_steps = [('filter', MNEBandPass(l_freq, h_freq, SFREQ)), ('coh', Coherences(coh='lagged')), ('avg_freq', AverageFrequencies()), ('spd', NearestSPD()), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
+                    
+                    fe_pipeline = Pipeline(fe_steps)
+                    
+                    # Fit pre-transformation op de N-1 subjects
+                    X_train_trans = fe_pipeline.fit_transform(X_input[train_idx], y[train_idx])
+                    X_val_trans = fe_pipeline.transform(X_input[val_idx])
+                    
+                    # Nested Hyperparameter tuning op de N-1 subjects
+                    cv_inner = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+                    model_svm = SVC(class_weight='balanced', random_state=RANDOM_STATE)
+                    
+                    search = GridSearchCV(model_svm, svm_param_grid, cv=cv_inner, scoring='balanced_accuracy', n_jobs=-1, verbose=0)
+                    inner_groups = groups[train_idx]
+                    search.fit(X_train_trans, y[train_idx], groups=inner_groups)
+                    
+                    # Voorspel op alle epochs van het ongeziene subject en pas majority voting toe
+                    preds_epochs = search.predict(X_val_trans)
+                    final_vote = Counter(preds_epochs).most_common(1)[0][0]
+                    
+                    y_true_subj.append(y[val_idx][0])
+                    y_pred_subj.append(final_vote)
+                    best_params_log = str(search.best_params_) # Bewaart de params van de laatste iteratie ter referentie
 
-            mean_acc = np.mean(fold_scores)
+            # Bereken de uiteindelijke balanced accuracy na alle folds, puur op subject niveau
+            mean_acc = balanced_accuracy_score(y_true_subj, y_pred_subj)
+            mean_consistency = np.mean(consistency_list) # <--- 3. BEREKEN GEMIDDELDE
             arch_time = time.time() - arch_start_time
-            # Gebruik \r (carriage return) om de tekst over de oude voortgangsbalk te printen voor een strakke output
-            print(f"\r    ✅ Mean Bal. Acc: {mean_acc:.4f} (Completed in {arch_time:.1f}s)")
+            
+            print(f"\r    ✅ LOSOCV Subj-Level Bal. Acc: {mean_acc:.4f} (Consistency: {mean_consistency:.2%}) (Completed in {arch_time:.1f}s)")
+            
             
             results.append({
                 'Band': band_name.upper(), 
                 'Layout': 'WHOLE', 
                 'Architecture': p_name, 
                 'CV_Balanced_Accuracy': mean_acc, 
+                'Intra_Subject_Consistency': f"{mean_consistency:.2%}",
                 'Optimal_Params': best_params_log
             })
             
@@ -166,24 +186,24 @@ def run_whole_brain_exploration():
         best_row = band_rows.iloc[0]
         best_arch = best_row['Architecture']
         
-        print(f"-> Freezing final model for {band_name.upper()} ({best_arch})...")
+        print(f"-> Freezing final model for {band_name.upper()} ({best_arch}) on Full Master Cohort...")
         
         if best_arch == 'MDM_Cov':
             final_pipe = MDM(metric=dict(mean='riemann', distance='riemann'))
-            X_final_input = np.load(RIEMANN_DATA_DIR / f"covs_train_{band_name}_whole.npy")
+            X_final_input = np.load(RIEMANN_DATA_DIR / f"covs_master_{band_name}_whole.npy")
         else:
             import ast
-            p_dict = ast.literal_eval(best_row['Optimal_Params'])
+            p_dict = ast.literal_eval(best_row['Optimal_Params']) if "{" in best_row['Optimal_Params'] else {}
             
             if best_arch == 'TSSVM_Cov':
                 final_steps = [('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
-                X_final_input = np.load(RIEMANN_DATA_DIR / f"covs_train_{band_name}_whole.npy")
+                X_final_input = np.load(RIEMANN_DATA_DIR / f"covs_master_{band_name}_whole.npy")
             elif best_arch == 'TSSVM_Xdawn':
                 final_steps = [('filter', MNEBandPass(BANDS[band_name][0], BANDS[band_name][1], SFREQ)), ('xdawn', XdawnCovariances(nfilter=6, estimator='oas')), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
                 X_final_input = X_raw
-            elif best_arch == 'TSSVM_Coh':
-                final_steps = [('filter', MNEBandPass(BANDS[band_name][0], BANDS[band_name][1], SFREQ)), ('coh', Coherences(coh='lagged')), ('avg_freq', AverageFrequencies()), ('spd', NearestSPD()), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
-                X_final_input = X_raw
+            # elif best_arch == 'TSSVM_Coh':
+            #     final_steps = [('filter', MNEBandPass(BANDS[band_name][0], BANDS[band_name][1], SFREQ)), ('coh', Coherences(coh='lagged')), ('avg_freq', AverageFrequencies()), ('spd', NearestSPD()), ('ts', TangentSpace(metric='riemann')), ('scaler', StandardScaler())]
+            #     X_final_input = X_raw
                 
             final_steps.append(('svm', SVC(class_weight='balanced', probability=True, random_state=RANDOM_STATE, **p_dict)))
             final_pipe = Pipeline(final_steps)
@@ -194,7 +214,7 @@ def run_whole_brain_exploration():
 
     total_time = (time.time() - total_start_time) / 60
     print(f"\n✅ Script 2 Complete! Total Execution Time: {total_time:.2f} minutes.")
-    print("Whole Brain scoreboard and optimized models saved.")
+    print("Whole Brain scoreboard and optimized LOSOCV models saved.")
 
 if __name__ == "__main__":
     run_whole_brain_exploration()

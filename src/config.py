@@ -66,8 +66,8 @@ SVM_FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 # POST-HOC EVALUATION & CROSS-DOMAIN SETTINGS
 # ==============================================================================
 # The primary frequency band used for SHAP, Bias Evaluation, and Cross Validation
-FOCUS_BAND = 'gamma' # change to the best band from 1_SVM_feature_ranking  **Gamma or Beta
-BEST_BANDS = ['Theta', 'Gamma'] #whole brain = theta and gamma, ROI = Theta and alpha
+FOCUS_BAND = 'beta' # change to the best band from 1_SVM_feature_ranking  **Gamma or Beta
+BEST_BANDS = ['beta', 'delta'] #whole brain = theta and gamma, ROI = Theta and alpha
 
 
 # Internal Cross-Domain Validation cohorts (matched with participants.tsv 'study' column)

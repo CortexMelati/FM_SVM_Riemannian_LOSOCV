@@ -5,8 +5,8 @@
 Overview:
     This script generates a top 5 physiological network map for the winning 
     frequency bands (dynamically read from the ROI ablation scoreboard).
-    It fits a Surrogate Linear Tangent Space SVM strictly for spatial 
-    interpretability.
+    It fits a Surrogate Linear Tangent Space SVM on the Master Cohort strictly 
+    for spatial interpretability.
     
 python 4_plot_riemann_results.py
 =============================================================================
@@ -56,10 +56,11 @@ def plot_surrogate_riemannian_weights():
         for j in range(i, n_channels):
             pair_map.append((roi_channels[i], roi_channels[j]))
 
-    y_path = RIEMANN_DATA_DIR / "y_train_riemann.npy"
+    # AANGEPAST NAAR MASTER DATASET
+    y_path = RIEMANN_DATA_DIR / "y_master_riemann.npy"
     if not y_path.exists():
         sys.exit(f"🚨 Kon de labels niet vinden: {y_path}")
-    y_train = np.load(y_path)
+    y_master = np.load(y_path)
 
     # 3. LOOP OVER DE WINNENDE BANDEN EN TEKEN EEN KAART PER BAND
     for band_name in winning_bands:
@@ -67,21 +68,23 @@ def plot_surrogate_riemannian_weights():
         
         # Omdat de band in je scoreboard als UPPERCASE staat, formatten we hem even
         band_file_name = band_name.lower()
-        covs_path = RIEMANN_DATA_DIR / f"covs_train_{band_file_name}_roi.npy"
+        
+        # AANGEPAST NAAR MASTER COVARIANCES
+        covs_path = RIEMANN_DATA_DIR / f"covs_master_{band_file_name}_roi.npy"
         
         if not covs_path.exists():
             print(f"⚠️ Covariantiematrices voor {band_name} niet gevonden. Wordt overgeslagen.")
             continue
             
-        X_cov_train = np.load(covs_path)
+        X_cov_master = np.load(covs_path)
         
         # --- TRAIN HET LINEAIRE SURROGATE MODEL ---
-        print(f"-> Fitting Linear Surrogate SVM op de {band_name} Tangent Space...")
+        print(f"-> Fitting Linear Surrogate SVM op de {band_name} Master Tangent Space...")
         ts = TangentSpace(metric='riemann')
-        X_ts = ts.fit_transform(X_cov_train)
+        X_ts = ts.fit_transform(X_cov_master)
         
         clf = SVC(kernel='linear', C=1.0)
-        clf.fit(X_ts, y_train)
+        clf.fit(X_ts, y_master)
         svm_coefs = clf.coef_[0]
 
         # --- KOPPEL EN FILTER DE GEWICHTEN ---
@@ -147,6 +150,16 @@ def plot_surrogate_riemannian_weights():
                 pass
 
         ax.set_title(f"Riemannian TS-SVM Connectivity\n({band_name} Band - Linear Surrogate)", fontsize=14, pad=20)
+        
+        # --- NIEUW: Voeg handmatig een legenda toe voor de lijnkleuren/diktes ---
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='#FF8C94', lw=5.0, label='Top 20% Impact'),
+            Line2D([0], [0], color='#8B4513', lw=3.5, label='Top 20-60% Impact'),
+            Line2D([0], [0], color='#228B22', lw=2.0, label='Bottom 40% Impact')
+        ]
+        ax.legend(handles=legend_elements, loc='lower left', title="Mathematical Vector Importance", fontsize=10)
+
         plt.tight_layout()
         
         save_path = RIEMANN_FIGURES_DIR / f"Figure_Riemann_Network_{band_name}_Surrogate.png"

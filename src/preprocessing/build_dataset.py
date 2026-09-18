@@ -1,54 +1,51 @@
 """
 =============================================================================
-2. DATASET AGGREGATION & TRAIN/TEST SPLIT (Li et al., 2026 Methodology)
+2. DATASET AGGREGATION FOR LOSOCV (Leave-One-Subject-Out)
 =============================================================================
 Overview:
     Aggregates feature files, identifies the study cohort via participants.tsv,
-    and STRICTLY isolates the primary cohort for the Train/Test split.
-    The target domain (e.g., 'NCCP') is saved separately to prevent data leakage
-    prior to cross-domain validation.
+    and creates a single Master Dataset for the primary cohort.
+    The Train/Test split is completely removed here, as the LOSOCV 
+    framework will handle dynamic subject-level splitting during model training.
     
-python build_dataset.py
+    The target domain (e.g., 'NCCP') is still saved separately.
+    
+Execution:
+    python 2_build_dataset.py
 =============================================================================
 """
 
 import os
 import glob
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import sys
 from pathlib import Path
 
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir.parent))
-from config import (RESULTS_DIR, LABEL_MAPPING, TEST_SIZE, RANDOM_STATE, 
-                    PROCESSED_DATA_DIR, PROJECT_ROOT, ACTIVE_DATASET_NAME,
-                    CROSS_SOURCE_DATASET, CROSS_TARGET_DATASET, CP_FM_DIR)
+from config import (RESULTS_DIR, LABEL_MAPPING, RANDOM_STATE, 
+                    PROCESSED_DATA_DIR, CROSS_SOURCE_DATASET, 
+                    CROSS_TARGET_DATASET, CP_FM_DIR)
 
-print("Starting Dataset Aggregation...")
+print("Starting Dataset Aggregation for LOSOCV...")
 
-# 1. LOAD FEATURES
+# =============================================================================
+# 1. LOAD & FILTER FEATURES
+# =============================================================================
 file_pattern = os.path.join(RESULTS_DIR, "**", "*_features.csv")
 feature_files = glob.glob(file_pattern, recursive=True)
 
 if not feature_files:
-    print(f"Error: No *_features.csv files found.")
-    sys.exit()
+    sys.exit("Error: No *_features.csv files found.")
 
-all_data = []
-for file in feature_files:
-    all_data.append(pd.read_csv(file))
-    
+all_data = [pd.read_csv(file) for file in feature_files]
 master_df = pd.concat(all_data, ignore_index=True)
-master_df = master_df.copy() # <-- FIX: This resolves the PerformanceWarning!
 
 # --- EC FILTERING ---
 if 'Condition' in master_df.columns:
     initial_rows = len(master_df)
     master_df = master_df[master_df['Condition'] == 'EC'].copy()
     print(f"-> Filtered to EC only: removed {initial_rows - len(master_df)} non-EC rows.")
-else:
-    print("-> WARNING: No 'Condition' column found. Proceeding with all data.")
 
 def assign_label(subject_id):
     subject_upper = str(subject_id).upper()
@@ -62,111 +59,54 @@ master_df['Target'] = master_df['Subject'].apply(assign_label)
 master_df = master_df.dropna(subset=['Target'])
 master_df['Target'] = master_df['Target'].astype(int)
 
+# =============================================================================
 # 2. MERGE WITH METADATA TO PREVENT DATA MIXING
+# =============================================================================
 tsv_path = CP_FM_DIR / "data" / "participants.tsv" 
-
 if not tsv_path.exists():
-    print(f"FATAL ERROR: Cannot find participants.tsv at path:\n{tsv_path}")
-    sys.exit()
+    sys.exit(f"FATAL ERROR: Cannot find participants.tsv at path:\n{tsv_path}")
 
 participants_df = pd.read_csv(tsv_path, sep='\t')
-
 if 'participant_id' in participants_df.columns:
     participants_df['Subject'] = participants_df['participant_id']
 
-# Voer de merge uit
 merged_df = pd.merge(master_df, participants_df[['Subject', 'study']], on='Subject', how='inner')
-
 if merged_df.empty:
-    print("FATAL ERROR: Merge resulted in 0 rows! Please check your file names and TSV IDs.")
-    sys.exit()
+    sys.exit("FATAL ERROR: Merge resulted in 0 rows! Check file names and TSV IDs.")
 
-# 3. ISOLATE PRIMARY COHORT AND TARGET COHORT
-# Using variables defined in config.py
+# =============================================================================
+# 3. ISOLATE COHORTS
+# =============================================================================
 source_cohort_name = CROSS_SOURCE_DATASET
 target_cohort_name = CROSS_TARGET_DATASET
 
-source_df = merged_df[merged_df['study'] == source_cohort_name].copy()
-target_df = merged_df[merged_df['study'] == target_cohort_name].copy()
-
-# Drop the 'study' column now that we have isolated them
-source_df = source_df.drop(columns=['study'])
-target_df = target_df.drop(columns=['study'])
+source_df = merged_df[merged_df['study'] == source_cohort_name].copy().drop(columns=['study'])
+target_df = merged_df[merged_df['study'] == target_cohort_name].copy().drop(columns=['study'])
 
 print("\nDATA SEPARATION COMPLETE:")
-print(f"   -> Primary Cohort ({source_cohort_name}): {source_df['Subject'].nunique()} subjects isolated for Train/Test.")
-print(f"   -> Target Cohort ({target_cohort_name}): {target_df['Subject'].nunique()} subjects isolated for Cross-Domain.")
+print(f"   -> Primary Cohort ({source_cohort_name}): {source_df['Subject'].nunique()} subjects isolated.")
+print(f"   -> Target Cohort ({target_cohort_name}): {target_df['Subject'].nunique()} subjects isolated.")
 
 # Save Target Domain
 target_path = PROCESSED_DATA_DIR / f"target_domain_{target_cohort_name.lower()}.csv"
 target_df.to_csv(target_path, index=False)
 
 # =============================================================================
-# 4. SUBJECT-LEVEL TRAIN/TEST SPLIT (ONLY ON THE SOURCE COHORT)
+# 4. CAP SEGMENTS FOR MASTER DATASET
 # =============================================================================
-unique_subjects = source_df[['Subject', 'Target']].drop_duplicates()
+# Limit every subject to a maximum of 5 segments (to ensure equal representation)
+sampled_master_data = []
+for subject, group in source_df.groupby('Subject'):
+    sampled_master_data.append(group.sort_values('Segment').head(5))
 
-train_subs, test_subs = train_test_split(
-    unique_subjects['Subject'], test_size=TEST_SIZE, 
-    random_state=RANDOM_STATE, stratify=unique_subjects['Target']
-)
-
-train_full_df = source_df[source_df['Subject'].isin(train_subs)].copy()
-test_df = source_df[source_df['Subject'].isin(test_subs)].copy()
+master_df_final = pd.concat(sampled_master_data).sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
 
 # =============================================================================
-# 5. DYNAMIC SEGMENT SAMPLING (Balancing the Training Set)
+# 5. SAVE FINAL MASTER DATASET
 # =============================================================================
-total_patient_segments = len(train_full_df[train_full_df['Target'] == 1])
-total_hc_segments = len(train_full_df[train_full_df['Target'] == 0])
-sampled_train_data = []
+master_path = PROCESSED_DATA_DIR / "final_dataset_master.csv"
+master_df_final.to_csv(master_path, index=False)
 
-if total_patient_segments <= total_hc_segments:
-    anchor_volume = total_patient_segments
-    majority_subjects = train_full_df[train_full_df['Target'] == 0]['Subject'].nunique()
-    optimal_segments = max(1, round(anchor_volume / majority_subjects)) if majority_subjects > 0 else 5
-    
-    for subject, group in train_full_df.groupby('Subject'):
-        target = group['Target'].iloc[0]
-        n_samples = min(5, len(group)) if target == 1 else min(optimal_segments, len(group))
-        sampled_train_data.append(group.sample(n=n_samples, random_state=RANDOM_STATE))
-else:
-    anchor_volume = total_hc_segments
-    majority_subjects = train_full_df[train_full_df['Target'] == 1]['Subject'].nunique()
-    optimal_segments = max(1, round(anchor_volume / majority_subjects)) if majority_subjects > 0 else 5
-    
-    for subject, group in train_full_df.groupby('Subject'):
-        target = group['Target'].iloc[0]
-        n_samples = min(5, len(group)) if target == 0 else min(optimal_segments, len(group))
-        sampled_train_data.append(group.sample(n=n_samples, random_state=RANDOM_STATE))
-
-train_df_final = pd.concat(sampled_train_data).sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
-
-# Hold-out testset (Strictly 5 segments)
-sampled_test_data = []
-for subject, group in test_df.groupby('Subject'):
-    if len(group) >= 5:
-        sampled_test_data.append(group.sort_values('Segment').head(5))
-        
-        
-# # Hold-out testset (Strictly max 5 segments per subject), if the dataset contains less than a 5 minute block, use this
-# sampled_test_data = []
-# for subject, group in test_df.groupby('Subject'):
-#     # Pakt maximaal 5 segmenten. Als het er 3 zijn, pakt hij er 3.
-#     sampled_test_data.append(group.sort_values('Segment').head(5))
-
-test_df_final = pd.concat(sampled_test_data).sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
-
-# =============================================================================
-# 6. SAVE FINAL DATASETS
-# =============================================================================
-train_path = PROCESSED_DATA_DIR / "final_dataset_train.csv"
-test_path = PROCESSED_DATA_DIR / "final_dataset_test.csv"
-
-train_df_final.to_csv(train_path, index=False)
-test_df_final.to_csv(test_path, index=False)
-
-print("\nDATASET CREATION SUCCESSFUL (Methodology Aligned)")
-print(f"Train set ({source_cohort_name}): {train_path.name} | Rows: {len(train_df_final)}")
-print(f"Test set ({source_cohort_name}):  {test_path.name} | Rows: {len(test_df_final)}")
-print(f"Target ({target_cohort_name}):  {target_path.name} | Rows: {len(target_df)}")
+print("\nMASTER DATASET CREATION SUCCESSFUL (LOSOCV Ready)")
+print(f"Master set ({source_cohort_name}): {master_path.name} | Rows: {len(master_df_final)} | Unique Subjects: {master_df_final['Subject'].nunique()}")
+print(f"Target ({target_cohort_name}): {target_path.name} | Rows: {len(target_df)}")

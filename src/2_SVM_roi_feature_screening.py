@@ -3,10 +3,14 @@
 2. ROI Feature Screening (Top 10 Selection)
 =============================================================================
 Overview:
-    This script filters the dataset strictly to the 9-channel Central ROI 
-    and the designated focus band (resulting in 36 potential features). 
-    It trains a baseline SVM and uses SHAP to identify the Top 10 most 
-    predictive connectivity features within this restricted space.
+    This script filters the master dataset strictly to the 9-channel 
+    Central ROI and the designated focus band (resulting in 36 potential 
+    features). It trains a baseline SVM on the full master dataset and 
+    uses SHAP to identify the Top 10 most predictive connectivity features 
+    within this restricted space.
+    
+    The output of this script is fed into the mSFFS pipeline, where 
+    strict LOSOCV will be applied.
 
 Execution:
     python 2_SVM_roi_feature_screening.py
@@ -22,7 +26,6 @@ import sys
 from pathlib import Path
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
 
 current_dir = Path(__file__).resolve().parent
 sys.path.append(str(current_dir.parent))
@@ -34,49 +37,48 @@ from config import (RESULTS_DIR, RANDOM_STATE, PROCESSED_DATA_DIR,
 # ==========================================
 print(f"Starting ROI Feature Screening ({FOCUS_BAND.upper()} Band)...")
 
-train_path = PROCESSED_DATA_DIR / "final_dataset_train.csv"
-if not train_path.exists():
-    print(f"Error: {train_path.name} not found. Run build_dataset.py first.")
-    sys.exit()
+# Wijziging: Load the new Master Dataset
+master_path = PROCESSED_DATA_DIR / "final_dataset_master.csv"
+if not master_path.exists():
+    sys.exit(f"🚨 Error: {master_path.name} not found. Run 2_build_dataset.py first.")
 
-train_df = pd.read_csv(train_path)
+master_df = pd.read_csv(master_path)
 
-y_train = train_df['Target'].values
+y_master = master_df['Target'].values
 meta_cols = ['Subject', 'Target', 'Condition', 'Segment']
-X_train_full = train_df.drop(columns=[c for c in meta_cols if c in train_df.columns])
+X_master_full = master_df.drop(columns=[c for c in meta_cols if c in master_df.columns])
 
 # Filter to only include features where BOTH channels are in the ROI and in the Focus Band
 roi_features = []
-for col in X_train_full.columns:
+for col in X_master_full.columns:
     if f'({FOCUS_BAND})' in col:
         pair = col.replace(f'({FOCUS_BAND})', '').split('-')
         if pair[0] in BEST_CHANNELS_EVALUATE and pair[1] in BEST_CHANNELS_EVALUATE:
             roi_features.append(col)
 
-X_train_roi = X_train_full[roi_features]
+X_master_roi = X_master_full[roi_features]
 print(f"-> Filtered to {len(roi_features)} features (9 ROI channels, {FOCUS_BAND.upper()} band).")
 
 # ==========================================
 # 2. SCALING AND SVM TRAINING
 # ==========================================
 scaler = StandardScaler()
-X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_roi), columns=X_train_roi.columns)
+X_master_scaled = pd.DataFrame(scaler.fit_transform(X_master_roi), columns=X_master_roi.columns)
 
 print("-> Training intermediate SVM for SHAP screening...")
 screening_svm = SVC(kernel='rbf', gamma='scale', probability=True, random_state=RANDOM_STATE)
-screening_svm.fit(X_train_scaled, y_train)
+screening_svm.fit(X_master_scaled, y_master)
 
 # ==========================================
 # 3. SHAP ANALYSIS
 # ==========================================
 print("-> Calculating SHAP values for the ROI features...")
 
-background = shap.kmeans(X_train_scaled, 10) 
+background = shap.kmeans(X_master_scaled, 10) 
 explainer = shap.KernelExplainer(screening_svm.predict_proba, background)
 
-# Zet de algemene numpy seed vast voor de permutaties van de explainer
 np.random.seed(RANDOM_STATE)
-shap_values = explainer.shap_values(X_train_scaled)
+shap_values = explainer.shap_values(X_master_scaled)
 
 if isinstance(shap_values, list):
     shap_values_fm = shap_values[1]
@@ -88,7 +90,7 @@ else:
 mean_abs_shap = np.abs(shap_values_fm).mean(axis=0)
 
 feature_importance = pd.DataFrame({
-    'Feature': X_train_scaled.columns,
+    'Feature': X_master_scaled.columns,
     'Mean_Abs_SHAP': mean_abs_shap
 }).sort_values(by='Mean_Abs_SHAP', ascending=False)
 
@@ -108,7 +110,6 @@ print(f"-> Saved Top 10 features to {top_10_path.name}")
 # ==========================================
 print("\nGenerating Topographical Map for Top 5 Features...")
 
-# 1. Gebruik uitsluitend de 19 klassieke kanalen (zoals in de paper)
 standard_19 = ['Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T7', 'C3', 'Cz', 'C4', 'T8', 'P7', 'P3', 'Pz', 'P4', 'P8', 'O1', 'O2']
 montage = mne.channels.make_standard_montage('standard_1020')
 info = mne.create_info(ch_names=standard_19, sfreq=500, ch_types='eeg')
@@ -117,7 +118,6 @@ info.set_montage(montage)
 fig, ax = plt.subplots(figsize=(8, 8))
 mne.viz.plot_sensors(info, show_names=True, axes=ax)
 
-# 2. Clean up sensor styling (witte cirkels met subtiele grijze rand)
 for collection in ax.collections:
     collection.set_sizes([600])
     collection.set_facecolor('white')
@@ -138,7 +138,6 @@ for _, row in top_5_df.iterrows():
         x_coords = [ch_pos[node1][0], ch_pos[node2][0]]
         y_coords = [ch_pos[node1][1], ch_pos[node2][1]]
         
-        # Gebruik de originele Mean_Abs_SHAP en drempelwaarden gebaseerd op JOUW verdeling
         val = row['Mean_Abs_SHAP']
         if val >= max_shap * 0.80:       # Top 20% connecties (Roze)
             color, lw = '#FF8C94', 5.0
@@ -154,8 +153,8 @@ for _, row in top_5_df.iterrows():
 ax.set_title(f"Top 5 Connectivity Features within ROI\n({FOCUS_BAND.upper()} Band - SHAP Importance)", fontsize=14, pad=20)
 plt.tight_layout()
 
-# Sla op met een transparante achtergrond voor in je LaTeX document
-plot_path = FIGURES_DIR / f"Figure_Intermediate_Top5_ROI_{FOCUS_BAND}.png"
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+plot_path = FIGURES_DIR / f"Figure_Intermediate_Top5_ROI_{FOCUS_BAND}_LOSOCV.png"
 plt.savefig(plot_path, dpi=300, transparent=False)
 plt.close()
 
