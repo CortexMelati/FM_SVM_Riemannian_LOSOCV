@@ -1,17 +1,12 @@
 """
 =============================================================================
 SCRIPT 3.5: TARGETED RIEMANNIAN METRICS EXTRACTOR (TABLE 12)
-=============================================================================
-Overview:
-    Strictly evaluates ONLY the two models needed for the thesis table:
-    1. BETA Band with TSSVM_Cov (ROI)
-    2. DELTA Band with TSSVM_Coh (ROI)
-    
+
+
     Adheres strictly to the methodology text:
     - Leave-One-Subject-Out Cross-Validation (LOSOCV) outer loop.
     - 5x repeated 5-fold Stratified Group CV inner loop for hyperparameter tuning.
-    
-    Calculates Bootstrapped 95% Confidence Intervals and Intra-Subject Consistency.
+
 =============================================================================
 """
 
@@ -116,8 +111,8 @@ def run_table_12_metrics():
     # De drie geselecteerde modellen voor de thesis:
     targets = [
         {'band': 'BETA', 'arch': 'TSSVM_Cov'},
-        {'band': 'DELTA', 'arch': 'TSSVM_Coh'},
-        {'band': 'ALPHA', 'arch': 'TSSVM_Xdawn'}
+        # {'band': 'DELTA', 'arch': 'TSSVM_Coh'}, # takes 54 hours to process
+        # {'band': 'ALPHA', 'arch': 'TSSVM_Xdawn'} # not included in the paper, added for completeness
     ]
     
     results_list = []
@@ -154,7 +149,6 @@ def run_table_12_metrics():
                 ('scaler', StandardScaler())
             ]
             
-        # Voeg cv_train_scores toe aan de lijsten
         y_true_subj, y_pred_subj, y_prob_subj, consistency_subj, cv_train_scores = [], [], [], [], []
         
         for train_idx, val_idx in tqdm(logo.split(X_input, y, groups), total=n_subjects, desc=f"   🔄 LOSOCV", leave=False, colour='green'):
@@ -252,48 +246,11 @@ def run_table_12_metrics():
             'ECE': f"{ece:.4f}",
             'Permutation_P': f"{pvalue:.4f}"
         })
-        
 
-        # Bootstrapped CI's
-        ci_bal_acc = get_bootstrap_ci(y_true_subj, y_pred_subj, balanced_accuracy_score)
-        ci_prec = get_bootstrap_ci(y_true_subj, y_pred_subj, lambda yt, yp: precision_score(yt, yp, zero_division=0))
-        ci_rec = get_bootstrap_ci(y_true_subj, y_pred_subj, lambda yt, yp: recall_score(yt, yp, zero_division=0))
+        df_results = pd.DataFrame(results_list)
+        save_path = RIEMANN_DATA_DIR / "table_12_riemann_metrics.csv"
+        df_results.to_csv(save_path, index=False)
 
-        # Permutation P-Value
-        n_permutations = 1000
-        permuted_scores = [balanced_accuracy_score(shuffle(y_true_subj, random_state=RANDOM_STATE + i), y_pred_subj) for i in range(n_permutations)]
-        pvalue = (np.sum(np.array(permuted_scores) >= bal_acc) + 1) / (n_permutations + 1)
-        
-        print(f"\n   ✅ RESULTS FOR {band_name} ({arch_name}):")
-        print(f"   Bal. Acc    : {bal_acc:.2%} {ci_bal_acc}")
-        print(f"   Consistency : {mean_cons:.2%}")
-        print(f"   Sensitivity : {rec:.2%} {ci_rec}")
-        print(f"   Precision   : {prec:.2%} {ci_prec}")
-        print(f"   FPR / FNR   : {fpr:.2%} / {fnr:.2%}")
-        print(f"   AUROC       : {auc:.4f}")
-        print(f"   Brier Score : {brier:.4f}")
-        print(f"   ECE         : {ece:.4f}")
-        print(f"   P-Value     : {pvalue:.4f}\n")
-        
-        results_list.append({
-            'Band': band_name,
-            'Architecture': arch_name,
-            'Balanced_Accuracy': f"{bal_acc*100:.2f} {ci_bal_acc}",
-            'Intra_Subj_Consistency': f"{mean_cons:.2%}",
-            'Sensitivity': f"{rec*100:.2f} {ci_rec}",
-            'Precision': f"{prec*100:.2f} {ci_prec}",
-            'FPR': f"{fpr*100:.2f}",
-            'FNR': f"{fnr*100:.2f}",
-            'AUROC': f"{auc:.4f}",
-            'Brier_Score': f"{brier:.4f}",
-            'ECE': f"{ece:.4f}",
-            'Permutation_P': f"{pvalue:.4f}"
-        })
-
-    df_results = pd.DataFrame(results_list)
-    save_path = RIEMANN_DATA_DIR / "table_12_riemann_metrics.csv"
-    df_results.to_csv(save_path, index=False)
-    
     time_spent = (time.time() - total_start) / 60
     print(f"🎉 Script Complete! Total Time: {time_spent:.1f} minutes.")
     print(f"💾 All results ready for LaTeX saved to: {save_path.name}")
