@@ -1,6 +1,6 @@
 # EEG-Based Fibromyalgia Classification Pipeline
 
-**A Methodological Replication and Extension of Li et al. (2026)**
+**Inspired by the paper of Li et al. (2026)**
 *Paper DOI:* [10.3389/fpain.2025.1704444](https://doi.org/10.3389/fpain.2025.1704444)
 
 ### Datasets
